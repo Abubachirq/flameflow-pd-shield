@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Iterable
 
 from .normalize import _parses, _score, morph, normalize_person  # noqa: F401
@@ -38,6 +39,10 @@ class Span:
     type: str      # person / phone / email / birthdate / address
     text: str
     source: str    # ner / dict / initials / case / regex
+    # написание для разбора имени, если оно отличается от текста:
+    # «тимофеву» (строчными, с опечаткой) разбирается как «Тимофееву»,
+    # чтобы получить метку того же человека, что и правильное написание
+    canon: str | None = None
 
 
 # ---------------------------------------------------------------- регулярки
@@ -74,6 +79,15 @@ RE_CASE_FIO = re.compile(
 )
 
 _CYR_TOKEN = re.compile(r"[А-ЯЁ][а-яё\-]+")
+# для словаря: слово с любой буквы — в чатах имена пишут строчными
+_CYR_TOKEN_ANY = re.compile(r"[А-ЯЁа-яё][а-яё\-]+")
+
+# Опечатка в фамилии из словаря: насколько написанное слово должно быть
+# похоже на одну из падежных форм фамилии (1.0 — совпадает целиком).
+# 0.8 ловит одну пропущенную, лишнюю или перепутанную букву в фамилии
+# от 5 букв; проверяются только слова, которых морфология не знает.
+TYPO_SIMILARITY = 0.8
+TYPO_MIN_LEN = 5
 
 STOP_WORDS = {
     "заказчик", "заказчика", "заказчику", "заказчиком", "исполнитель",
@@ -103,11 +117,32 @@ class NameDictionary:
     слова из словаря считается находкой. Это добор к NER для редких
     фамилий и обязательная страховка: имена, которые клиент назвал
     сам, не должны зависеть от чутья модели.
+
+    Слово с заглавной буквы — находка, как и раньше. Слово строчными
+    или с опечаткой тоже находка, но осторожнее: имя строчными («роман»,
+    «вера») часто обычное слово, поэтому оно маскируется только рядом
+    с другим словом из словаря («ольге викторовне»). Фамилия строчными
+    маскируется и одна. Опечатка ищется только в фамилиях и только
+    в словах, которых морфология не знает: «смирно» не станет Смирновой.
+    Фамилия, совпадающая с обычным словом, строчными в своей словарной
+    форме маскируется всегда («козлов» при Козлове: имя важнее текста),
+    в других формах — только рядом с именем («кузнецов» при Кузнецовой).
+
+    Известные ограничения: опечатка, превратившая фамилию в настоящее
+    слово языка, не ловится; незнакомое морфологии слово, похожее на
+    фамилию из словаря («Тимофеевка» при Тимофееве), маскируется;
+    имя с отчеством без фамилии получает свою метку, не метку человека
+    с фамилией (так было и для заглавных букв).
     """
 
     def __init__(self, names: Iterable[str]):
         self.lemmas: set[str] = set()
         self.exact: set[str] = set()
+        self.surname_lemmas: set[str] = set()
+        self.surname_exact: set[str] = set()
+        # падежная форма фамилии строчными -> та же форма с заглавной
+        self.surname_forms: dict[str, str] = {}
+        self._typo_cache: dict[str, str | None] = {}
         for name in names:
             key = normalize_person(name)
             for part in (key.surname, key.first, key.middle):
@@ -115,6 +150,17 @@ class NameDictionary:
                     self.exact.add(part.lower())
                     for p in _parses(part):
                         self.lemmas.add(p.normal_form)
+            if key.surname:
+                surname = key.surname.lower()
+                self.surname_exact.add(surname)
+                self.surname_forms[surname] = key.surname
+                for p in _parses(surname):
+                    if "Surn" not in p.tag:
+                        continue
+                    self.surname_lemmas.add(p.normal_form)
+                    for form in p.lexeme:
+                        self.surname_forms.setdefault(
+                            form.word, form.word.capitalize())
 
     def _word_hits(self, word: str) -> bool:
         lower = word.lower()
@@ -122,34 +168,106 @@ class NameDictionary:
             return True
         return any(p.normal_form in self.lemmas for p in _parses(word))
 
+    def _surname_hits(self, word: str) -> bool:
+        if word.lower() in self.surname_exact:
+            return True
+        return any("Surn" in p.tag and p.normal_form in self.surname_lemmas
+                   for p in _parses(word))
+
+    @staticmethod
+    def _is_common_word(word: str) -> bool:
+        """У слова есть заметный разбор обычным словом, не именем:
+        «козлов» — это и фамилия, и родительный падеж от «козлы»."""
+        lower = word.lower()
+        if not morph().word_is_known(lower):
+            return False
+        return any(p.score >= 0.1 and not any(g in p.tag for g in ("Name", "Surn", "Patr"))
+                   for p in _parses(lower))
+
+    def _typo_of_surname(self, word: str) -> str | None:
+        """Форма фамилии из словаря, опечаткой которой похоже слово, или None.
+        Кеш: при индексации документов одно слово встречается много раз."""
+        key = word.lower()
+        if key not in self._typo_cache:
+            self._typo_cache[key] = self._find_typo(key)
+        return self._typo_cache[key]
+
+    def _find_typo(self, word: str) -> str | None:
+        lower = word.replace("ё", "е")
+        if len(lower) < TYPO_MIN_LEN or morph().word_is_known(lower):
+            return None
+        best, best_ratio = None, TYPO_SIMILARITY
+        for form, display in self.surname_forms.items():
+            form_e = form.replace("ё", "е")
+            if form_e[0] != lower[0] or abs(len(form_e) - len(lower)) > 2:
+                continue
+            ratio = SequenceMatcher(None, lower, form_e).ratio()
+            if ratio >= best_ratio:
+                best, best_ratio = display, ratio
+        return best
+
+    def _classify(self, word: str) -> tuple[str | None, str | None]:
+        """(сила находки, написание для разбора).
+
+        strong — маскируется и одно; weak — только рядом с другой находкой;
+        None — не имя из словаря.
+        """
+        if word[0].isupper() and self._word_hits(word):
+            return "strong", None
+        if word[0].islower() and self._word_hits(word):
+            # редкую фамилию морфология не разбирает как фамилию,
+            # тогда её выдаёт сходство с падежной формой из словаря
+            typo = self._typo_of_surname(word)
+            # фамилия ровно как в списке маскируется всегда: утечка имени
+            # хуже, чем метка на месте совпавшего с ней обычного слова
+            exact = word.lower() in self.surname_exact
+            surname = exact or ((self._surname_hits(word) or typo)
+                                and not self._is_common_word(word))
+            kind = "strong" if surname else "weak"
+            return kind, typo or word.capitalize()
+        typo = self._typo_of_surname(word)
+        if typo:
+            return "strong", typo
+        return None, None
+
     def spans(self, text: str) -> list[Span]:
         if not self.lemmas:
             return []
         out = []
-        run: list[tuple[int, int]] = []  # подряд идущие словарные слова
-        for m in _CYR_TOKEN.finditer(text):
-            if self._word_hits(m.group(0)):
+        # подряд идущие словарные слова: (начало, конец, сила, написание)
+        run: list[tuple[int, int, str, str | None]] = []
+        for m in _CYR_TOKEN_ANY.finditer(text):
+            kind, canon = self._classify(m.group(0))
+            if kind:
                 # Внутри одного имени слова разделяются только пробелами.
-                # Любой другой разделитель — запятая, скобка, союз «и» —
-                # это граница между людьми. Союз в токены не попадает
-                # (нужна заглавная), поэтому смотрим сам разрыв, а не длину:
-                # « и » — те же три символа, что и прежний допуск, и
-                # проскакивал, склеивая двух человек в одну метку.
+                # Любой другой разделитель — запятая, скобка — это граница
+                # между людьми, поэтому смотрим сам разрыв, а не его длину.
+                # Союз «и» — тоже слово: не будучи именем из словаря, он
+                # прерывает пробег (ветка ниже), и двое не склеиваются.
                 if run and text[run[-1][1]:m.start()].strip():
                     out.append(self._flush(text, run))
                     run = []
-                run.append((m.start(), m.end()))
+                run.append((m.start(), m.end(), kind, canon))
             elif run:
                 out.append(self._flush(text, run))
                 run = []
         if run:
             out.append(self._flush(text, run))
-        return out
+        return [s for s in out if s is not None]
 
     @staticmethod
-    def _flush(text: str, run: list[tuple[int, int]]) -> Span:
+    def _flush(text: str, run: list[tuple[int, int, str, str | None]]) -> Span | None:
+        kinds = [r[2] for r in run]
+        if "strong" not in kinds and len(kinds) < 2:
+            return None  # одно имя строчными — скорее обычное слово
         s, e = run[0][0], run[-1][1]
-        return Span(s, e, "person", text[s:e], "dict")
+        canon = None
+        if any(r[3] for r in run):
+            canon = text[s:e]
+            for start, end, _, word in reversed(run):
+                if word:
+                    canon = canon[:start - s] + word + canon[end - s:]
+        return Span(s, e, "person", text[s:e], "dict", canon)
 
 
 # ---------------------------------------------------------------- детекторы
@@ -294,7 +412,16 @@ def merge_person_spans(text: str, spans: list[Span],
         if not words:
             continue
         s, e = words[0][0], words[-1][1]
-        out.append(Span(s, e, "person", text[s:e], "merged"))
+        # исправленное написание словарных находок переносится в итог
+        canon_spans = sorted((p for p in persons if p.canon
+                              and p.start >= s and p.end <= e),
+                             key=lambda p: p.start, reverse=True)
+        canon = None
+        if canon_spans:
+            canon = text[s:e]
+            for p in canon_spans:
+                canon = canon[:p.start - s] + p.canon + canon[p.end - s:]
+        out.append(Span(s, e, "person", text[s:e], "merged", canon))
     return rest + out
 
 

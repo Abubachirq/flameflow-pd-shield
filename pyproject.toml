@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flameflow-pd-shield"
-version = "0.1.5"
+version = "0.1.6"
 description = "Обезличивание персональных данных для ботов Flameflow: маскирование до индексации, зашифрованное хранилище, восстановление в ответах LLM"
 requires-python = ">=3.10"
 dependencies = [

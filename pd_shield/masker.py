@@ -42,7 +42,7 @@ class Masker:
 
     def _label_for_span(self, span) -> str | None:
         if span.type == "person":
-            key = normalize_person(span.text)
+            key = normalize_person(span.canon or span.text)
             if not key.surname and not key.first:
                 return None  # мусорный спан, человека в нём не разобрать
             return self.vault.label_for_person(key)
